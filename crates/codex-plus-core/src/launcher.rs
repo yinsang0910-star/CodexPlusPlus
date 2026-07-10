@@ -475,6 +475,41 @@ fn helper_bind_host() -> String {
         .unwrap_or_else(|| "127.0.0.1".to_string())
 }
 
+struct ServiceTierPreloadEnv {
+    node_options: String,
+}
+
+fn prepare_service_tier_preload(
+    settings: &BackendSettings,
+) -> anyhow::Result<Option<ServiceTierPreloadEnv>> {
+    if !settings.enhancements_enabled {
+        return Ok(None);
+    }
+    let preload_path = crate::service_tier_preload::ensure_service_tier_preload()
+        .context("failed to prepare service tier preload")?;
+    let node_options = crate::service_tier_preload::node_options_with_service_tier_preload(
+        std::env::var("NODE_OPTIONS").ok().as_deref(),
+        &preload_path.to_string_lossy(),
+    );
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "launcher.service_tier_preload_enabled",
+        serde_json::json!({
+            "preload_path": preload_path.to_string_lossy(),
+            "service_tier_controls": settings.codex_app_service_tier_controls,
+        }),
+    );
+    Ok(Some(ServiceTierPreloadEnv { node_options }))
+}
+
+fn apply_service_tier_preload_env(command: &mut Command, preload: &ServiceTierPreloadEnv) {
+    command.env("NODE_OPTIONS", &preload.node_options);
+    if std::env::var_os("HOME").is_none()
+        && let Some(home) = crate::paths::default_app_state_dir().parent()
+    {
+        command.env("HOME", home);
+    }
+}
+
 #[async_trait(?Send)]
 impl LaunchHooks for DefaultLaunchHooks {
     fn resolve_app_dir(
@@ -655,6 +690,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
         let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        let service_tier_preload = prepare_service_tier_preload(settings)?;
         if cfg!(windows) {
             let activation = if let Some(inspector_port) = native_menu_inspector_port {
                 build_packaged_activation_with_native_menu_inspector(
@@ -667,6 +703,41 @@ impl LaunchHooks for DefaultLaunchHooks {
                 build_packaged_activation(app_dir, debug_port, &launch_extra_args)
             };
             if let Some(activation) = activation {
+                if let Some(preload) = &service_tier_preload {
+                    let command = if let Some(inspector_port) = native_menu_inspector_port {
+                        build_codex_command_with_native_menu_inspector(
+                            app_dir,
+                            debug_port,
+                            inspector_port,
+                            &launch_extra_args,
+                        )
+                    } else {
+                        build_codex_command(app_dir, debug_port, &launch_extra_args)
+                    };
+                    let executable = command
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("Codex command is empty"))?;
+                    let mut child_command = Command::new(executable);
+                    child_command
+                        .args(&command[1..])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                    apply_service_tier_preload_env(&mut child_command, preload);
+                    #[cfg(windows)]
+                    child_command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
+                    let child = child_command.spawn().with_context(|| {
+                        format!("failed to launch Codex executable {executable}")
+                    })?;
+                    *self.child.lock().await = Some(child);
+                    if let Some(inspector_port) = native_menu_inspector_port {
+                        start_native_menu_localizer(inspector_port);
+                    }
+                    return Ok(CodexLaunch::Process {
+                        command,
+                        wait_strategy: ProcessWaitStrategy::TrackedChild,
+                        macos_cleanup_policy: None,
+                    });
+                }
                 let CodexLaunch::PackagedActivation {
                     app_user_model_id,
                     arguments,
@@ -696,6 +767,40 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
 
         if app_dir.extension().and_then(|value| value.to_str()) == Some("app") {
+            if let Some(preload) = &service_tier_preload {
+                let command = if let Some(inspector_port) = native_menu_inspector_port {
+                    build_codex_command_with_native_menu_inspector(
+                        app_dir,
+                        debug_port,
+                        inspector_port,
+                        &launch_extra_args,
+                    )
+                } else {
+                    build_codex_command(app_dir, debug_port, &launch_extra_args)
+                };
+                let executable = command
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("macOS Codex command is empty"))?;
+                let mut child_command = Command::new(executable);
+                child_command
+                    .args(&command[1..])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                apply_service_tier_preload_env(&mut child_command, preload);
+                let child = child_command.spawn().with_context(|| {
+                    format!("failed to launch macOS Codex executable {executable}")
+                })?;
+                *self.child.lock().await = Some(child);
+                if let Some(inspector_port) = native_menu_inspector_port {
+                    start_native_menu_localizer(inspector_port);
+                }
+                return Ok(CodexLaunch::Process {
+                    command,
+                    wait_strategy: ProcessWaitStrategy::TrackedChild,
+                    macos_cleanup_policy: None,
+                });
+            }
+
             let cleanup_policy = if is_macos_app_running(app_dir).await {
                 MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
             } else {
@@ -749,6 +854,9 @@ impl LaunchHooks for DefaultLaunchHooks {
             .args(&command[1..])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(preload) = &service_tier_preload {
+            apply_service_tier_preload_env(&mut child_command, preload);
+        }
         #[cfg(windows)]
         child_command.creation_flags(crate::windows_integration::CREATE_NO_WINDOW);
         let child = child_command

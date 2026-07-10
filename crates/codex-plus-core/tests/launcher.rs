@@ -342,12 +342,38 @@ fn launcher_builds_debug_arguments_and_commands() {
 }
 
 #[test]
+fn launcher_macos_direct_command_targets_bundle_executable() {
+    let command = build_codex_command(Path::new("/Applications/OpenAI Codex.app"), 9229, &[]);
+    let executable = command[0].replace('\\', "/");
+
+    assert_eq!(
+        executable,
+        "/Applications/OpenAI Codex.app/Contents/MacOS/Codex"
+    );
+    assert!(!command.contains(&"open".to_string()));
+}
+
+#[test]
 fn launcher_does_not_override_codex_app_environment() {
     let source = include_str!("../src/launcher.rs");
 
     assert!(!source.contains(".envs(codex_process_environment())"));
     assert!(!source.contains("activate_packaged_app_with_environment"));
     assert!(!source.contains("with_temporary_proxy_environment"));
+}
+
+#[test]
+fn launcher_injects_service_tier_preload_with_node_options() {
+    let source = include_str!("../src/launcher.rs");
+
+    assert!(source.contains("prepare_service_tier_preload(settings)?"));
+    assert!(source.contains("ensure_service_tier_preload()"));
+    assert!(source.contains("node_options_with_service_tier_preload"));
+    assert!(source.contains("command.env(\"NODE_OPTIONS\", &preload.node_options)"));
+    assert!(source.contains("if let Some(preload) = &service_tier_preload"));
+    assert!(source.contains("build_codex_command(app_dir, debug_port, &launch_extra_args)"));
+    assert!(source.contains("failed to launch macOS Codex executable"));
+    assert!(source.contains("return Ok(CodexLaunch::Process"));
 }
 
 #[test]
